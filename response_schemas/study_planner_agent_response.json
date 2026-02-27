@@ -1,0 +1,22 @@
+{
+  "agent_name": "Study Planner Agent",
+  "agent_id": "69a16c3edb8e0879c3c8f2a7",
+  "description": "Conversational study planning assistant that understands student goals, generates personalized daily/weekly study schedules, prioritizes topics by importance and difficulty, recommends high-quality resources, and tracks progress through ongoing dialogue. Adapts plans based on student feedback and progress updates.",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "message": "string",
+    "study_plan": "string",
+    "suggestions": [
+      "string"
+    ]
+  },
+  "example_response": {
+    "message": "The conversational response text from the agent",
+    "study_plan": "sample",
+    "suggestions": [
+      "sample string"
+    ]
+  }
+}
