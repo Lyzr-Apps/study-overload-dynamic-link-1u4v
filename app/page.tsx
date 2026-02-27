@@ -328,56 +328,127 @@ function extractStudyPlan(raw: any): StudyPlan | null {
   }
 }
 
+/**
+ * Recursively unwrap a value that might be JSON-string-encoded multiple times.
+ * e.g. "\"{ ... }\"" -> parse -> "{ ... }" -> parse -> { ... }
+ */
+function deepParseJSON(val: any, depth = 0): any {
+  if (depth > 5) return val
+  if (typeof val !== 'string') return val
+  const trimmed = val.trim()
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('"')) return val
+  try {
+    const parsed = JSON.parse(trimmed)
+    // If we got another string, keep unwrapping
+    if (typeof parsed === 'string') return deepParseJSON(parsed, depth + 1)
+    return parsed
+  } catch {
+    return val
+  }
+}
+
+/**
+ * Extract the best structured data from the full API result.
+ * Handles the known Lyzr response patterns:
+ *
+ * Pattern A (direct): result.response.result = { message, study_plan, suggestions }
+ * Pattern B (text-only): result.response.result = { text: "..." }
+ *   with the full structured data buried in result.raw_response
+ *   raw_response = '{"response": "{...JSON string with study_plan...}", "module_outputs": {}}'
+ */
+function extractStructuredData(apiResult: any): any {
+  // Attempt 1: Direct path - result.response.result
+  let data = apiResult?.response?.result
+  data = deepParseJSON(data)
+
+  // Check if we already have study_plan at this level
+  if (data && typeof data === 'object' && data.study_plan) {
+    return data
+  }
+
+  // Unwrap one more level if there's a nested result
+  if (data?.result && typeof data.result === 'object') {
+    if (data.result.study_plan) return data.result
+  }
+
+  // Attempt 2: Parse raw_response which often contains the full structured JSON
+  const rawResponse = apiResult?.raw_response
+  if (rawResponse) {
+    const parsedRaw = deepParseJSON(rawResponse)
+    if (parsedRaw && typeof parsedRaw === 'object') {
+      // raw_response = { response: "{...stringified JSON...}", module_outputs: {} }
+      if (parsedRaw.response) {
+        const innerResponse = deepParseJSON(parsedRaw.response)
+        if (innerResponse && typeof innerResponse === 'object') {
+          if (innerResponse.study_plan) return innerResponse
+          // Maybe nested one more level
+          if (innerResponse.result) {
+            const innerResult = deepParseJSON(innerResponse.result)
+            if (innerResult && typeof innerResult === 'object' && innerResult.study_plan) {
+              return innerResult
+            }
+          }
+        }
+      }
+      // raw_response itself might be the structured data
+      if (parsedRaw.study_plan) return parsedRaw
+    }
+  }
+
+  // Attempt 3: Check result.response.message for embedded JSON
+  const respMessage = apiResult?.response?.message
+  if (respMessage) {
+    const parsedMsg = deepParseJSON(respMessage)
+    if (parsedMsg && typeof parsedMsg === 'object' && parsedMsg.study_plan) {
+      return parsedMsg
+    }
+  }
+
+  // Fallback: return whatever we have from the direct path
+  return data
+}
+
 function parseAgentResponse(result: any): {
   message: string
   study_plan: StudyPlan | null
   suggestions: string[]
 } {
-  // Layer 1: Get the core data from the API response
-  let data = result?.response?.result
+  // Use the deep extractor to find structured data from any nesting level
+  let data = extractStructuredData(result)
 
-  // Handle stringified JSON at the top level
-  data = tryParseJSON(data)
-
-  // Layer 2: Unwrap nested result wrapper
-  if (data?.result && typeof data.result === 'object' && !Array.isArray(data.result)) {
-    data = data.result
-  }
-
-  // Layer 3: Handle completely empty or missing data
+  // Handle empty/missing data
   if (!data || (typeof data === 'object' && Object.keys(data).length === 0)) {
-    // Fallback: try to get message from response.message
-    const msg =
+    const fallbackMsg =
       result?.response?.message ||
-      result?.raw_response ||
+      result?.response?.result?.text ||
       'I could not process that. Please try again.'
-    const parsed = tryParseJSON(msg)
-    if (parsed && typeof parsed === 'object') {
-      data = parsed
-    } else {
-      return { message: typeof msg === 'string' ? msg : String(msg), study_plan: null, suggestions: [] }
+    return {
+      message: typeof fallbackMsg === 'string' ? fallbackMsg : String(fallbackMsg),
+      study_plan: null,
+      suggestions: [],
     }
   }
 
-  // Layer 4: If data is still a string, it might be the message itself
+  // If data is still a string after all parsing, treat as plain message
   if (typeof data === 'string') {
     return { message: data, study_plan: null, suggestions: [] }
   }
 
-  // Layer 5: Extract study_plan with deep parsing
+  // Extract study_plan with deep parsing and normalization
   const studyPlan = extractStudyPlan(data.study_plan)
 
-  // Layer 6: Extract message - check multiple possible keys
+  // Extract message from multiple possible keys
+  const directResult = result?.response?.result
+  const directText = typeof directResult === 'object' ? directResult?.text : undefined
   const message =
     data.message ||
     data.text ||
-    data.response ||
-    data.answer ||
-    data.content ||
+    directText ||
+    result?.response?.message ||
     (studyPlan ? 'Here is your study plan!' : '') ||
     ''
 
-  // Layer 7: Extract suggestions safely
+  // Extract suggestions safely
   let suggestions: string[] = []
   if (Array.isArray(data.suggestions)) {
     suggestions = data.suggestions.filter((s: any) => typeof s === 'string' && s.trim())

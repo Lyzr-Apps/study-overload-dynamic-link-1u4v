@@ -60,6 +60,17 @@ function normalizeResponse(parsed: any): NormalizedAgentResponse {
     }
   }
 
+  // PRIORITY: If parsed has a study_plan, schedule, topics, or similar structured fields,
+  // preserve the entire object as the result to avoid stripping important data
+  if ('study_plan' in parsed || 'topics' in parsed || 'schedule' in parsed) {
+    return {
+      status: 'success',
+      result: parsed,
+      message: parsed.message || parsed.text,
+      metadata: parsed.metadata,
+    }
+  }
+
   if ('status' in parsed && 'result' in parsed) {
     return {
       status: parsed.status === 'error' ? 'error' : 'success',
