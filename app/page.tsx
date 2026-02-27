@@ -267,43 +267,123 @@ const SAMPLE_MESSAGES: ChatMessage[] = [
 
 // --- Agent Response Parser ---
 
+function tryParseJSON(val: any): any {
+  if (typeof val !== 'string') return val
+  try {
+    return JSON.parse(val)
+  } catch {
+    return val
+  }
+}
+
+function extractStudyPlan(raw: any): StudyPlan | null {
+  if (!raw || raw === 'null') return null
+  let plan = typeof raw === 'string' ? tryParseJSON(raw) : raw
+  if (!plan || typeof plan !== 'object') return null
+
+  // Validate it has at least a title or topics to be a real plan
+  const hasContent =
+    plan.title || plan.goal || (Array.isArray(plan.topics) && plan.topics.length > 0)
+  if (!hasContent) return null
+
+  return {
+    title: plan.title || 'Study Plan',
+    goal: plan.goal || '',
+    deadline: plan.deadline || '',
+    overall_progress:
+      typeof plan.overall_progress === 'number' ? plan.overall_progress : 0,
+    topics: Array.isArray(plan.topics)
+      ? plan.topics.map((t: any, i: number) => ({
+          id: t?.id || `topic-${i + 1}`,
+          name: t?.name || `Topic ${i + 1}`,
+          difficulty: t?.difficulty || 'Medium',
+          priority: typeof t?.priority === 'number' ? t.priority : i + 1,
+          estimated_hours:
+            typeof t?.estimated_hours === 'number' ? t.estimated_hours : 5,
+          completed: Boolean(t?.completed),
+          notes: t?.notes || '',
+        }))
+      : [],
+    schedule: Array.isArray(plan.schedule)
+      ? plan.schedule.map((d: any) => ({
+          day: d?.day || 'Day',
+          blocks: Array.isArray(d?.blocks)
+            ? d.blocks.map((b: any) => ({
+                time: b?.time || '',
+                topic: b?.topic || '',
+                activity: b?.activity || '',
+              }))
+            : [],
+        }))
+      : [],
+    resources: Array.isArray(plan.resources)
+      ? plan.resources.map((r: any) => ({
+          name: r?.name || 'Resource',
+          type: r?.type || 'Article',
+          topic: r?.topic || '',
+          url: r?.url || '',
+          description: r?.description || '',
+        }))
+      : [],
+  }
+}
+
 function parseAgentResponse(result: any): {
   message: string
   study_plan: StudyPlan | null
   suggestions: string[]
 } {
+  // Layer 1: Get the core data from the API response
   let data = result?.response?.result
 
-  if (typeof data === 'string') {
-    try {
-      data = JSON.parse(data)
-    } catch {
-      return { message: data, study_plan: null, suggestions: [] }
-    }
-  }
+  // Handle stringified JSON at the top level
+  data = tryParseJSON(data)
 
-  if (data?.result && typeof data.result === 'object') {
+  // Layer 2: Unwrap nested result wrapper
+  if (data?.result && typeof data.result === 'object' && !Array.isArray(data.result)) {
     data = data.result
   }
 
+  // Layer 3: Handle completely empty or missing data
   if (!data || (typeof data === 'object' && Object.keys(data).length === 0)) {
-    const msg = result?.response?.message || 'I could not process that. Please try again.'
-    return { message: msg, study_plan: null, suggestions: [] }
+    // Fallback: try to get message from response.message
+    const msg =
+      result?.response?.message ||
+      result?.raw_response ||
+      'I could not process that. Please try again.'
+    const parsed = tryParseJSON(msg)
+    if (parsed && typeof parsed === 'object') {
+      data = parsed
+    } else {
+      return { message: typeof msg === 'string' ? msg : String(msg), study_plan: null, suggestions: [] }
+    }
   }
 
-  const studyPlan = data.study_plan ?? null
-  if (studyPlan) {
-    studyPlan.topics = Array.isArray(studyPlan.topics) ? studyPlan.topics : []
-    studyPlan.schedule = Array.isArray(studyPlan.schedule) ? studyPlan.schedule : []
-    studyPlan.resources = Array.isArray(studyPlan.resources) ? studyPlan.resources : []
-    studyPlan.overall_progress = typeof studyPlan.overall_progress === 'number' ? studyPlan.overall_progress : 0
+  // Layer 4: If data is still a string, it might be the message itself
+  if (typeof data === 'string') {
+    return { message: data, study_plan: null, suggestions: [] }
   }
 
-  return {
-    message: data.message || data.text || '',
-    study_plan: studyPlan,
-    suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+  // Layer 5: Extract study_plan with deep parsing
+  const studyPlan = extractStudyPlan(data.study_plan)
+
+  // Layer 6: Extract message - check multiple possible keys
+  const message =
+    data.message ||
+    data.text ||
+    data.response ||
+    data.answer ||
+    data.content ||
+    (studyPlan ? 'Here is your study plan!' : '') ||
+    ''
+
+  // Layer 7: Extract suggestions safely
+  let suggestions: string[] = []
+  if (Array.isArray(data.suggestions)) {
+    suggestions = data.suggestions.filter((s: any) => typeof s === 'string' && s.trim())
   }
+
+  return { message, study_plan: studyPlan, suggestions }
 }
 
 // --- ErrorBoundary ---
@@ -394,7 +474,14 @@ export default function Page() {
       setActiveAgentId(AGENT_ID)
 
       try {
-        const result = await callAIAgent(msg, AGENT_ID, {
+        // Count user messages to determine if we should nudge plan generation
+        const userMsgCount = messages.filter((m) => m.role === 'user').length + 1
+        let finalMsg = msg
+        if (userMsgCount >= 2 && !currentPlan) {
+          finalMsg = `${msg}\n\n[SYSTEM NOTE: The student has now provided ${userMsgCount} messages. You MUST generate a complete study plan NOW with all fields populated (title, goal, deadline, overall_progress, topics, schedule, resources). Do not ask any more clarifying questions. Generate the plan immediately based on available information, making reasonable assumptions for any missing details.]`
+        }
+
+        const result = await callAIAgent(finalMsg, AGENT_ID, {
           user_id: userId,
           session_id: sessionId,
         })
@@ -402,6 +489,7 @@ export default function Page() {
         if (result.success) {
           const parsed = parseAgentResponse(result)
 
+          // If a plan is returned, update the sidebar
           if (parsed.study_plan) {
             setCurrentPlan(parsed.study_plan)
             setSidebarOpen(true)
@@ -413,17 +501,42 @@ export default function Page() {
             content: parsed.message || 'I have processed your request.',
             timestamp: new Date(),
             studyPlan: parsed.study_plan,
-            suggestions: parsed.suggestions,
+            suggestions:
+              parsed.suggestions.length > 0
+                ? parsed.suggestions
+                : parsed.study_plan
+                  ? [
+                      'Adjust the schedule',
+                      'Show more resources',
+                      'Change study hours',
+                      'Add more topics',
+                    ]
+                  : [],
           }
 
           setMessages((prev) => [...prev, assistantMessage])
         } else {
-          const errorMsg = result?.error || result?.response?.message || 'Something went wrong. Please try again.'
+          // Even on error, try to parse the response in case it has partial data
+          const parsed = parseAgentResponse(result)
+          if (parsed.study_plan) {
+            setCurrentPlan(parsed.study_plan)
+            setSidebarOpen(true)
+          }
+
+          const errorMsg =
+            parsed.message ||
+            result?.error ||
+            result?.response?.message ||
+            'Something went wrong. Please try again.'
           const errorMessage: ChatMessage = {
             id: `error-${Date.now()}`,
             role: 'assistant',
-            content: `I encountered an issue: ${errorMsg}. Please try rephrasing your request.`,
+            content: parsed.study_plan
+              ? errorMsg
+              : `I encountered an issue: ${errorMsg}. Please try rephrasing your request.`,
             timestamp: new Date(),
+            studyPlan: parsed.study_plan,
+            suggestions: parsed.suggestions,
           }
           setMessages((prev) => [...prev, errorMessage])
         }
@@ -440,7 +553,7 @@ export default function Page() {
         setActiveAgentId(null)
       }
     },
-    [loading, userId, sessionId]
+    [loading, userId, sessionId, messages, currentPlan]
   )
 
   const handleSuggestionClick = useCallback(
